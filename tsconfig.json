@@ -1,0 +1,636 @@
+
+## Database Schema
+
+### 1. **histoire** (existing)
+- `id` (PK)
+- `title`
+- `description`
+- other fields...
+
+### 2. **match** (existing)
+- `id` (PK)
+- `histoire_id` (FK)
+- `max_players` (int)
+- other fields...
+
+### 3. **histoire_pricing_tier** (new)
+```
+id (PK)
+histoire_id (FK) - nullable (null = global default, not null = histoire-specific)
+min_registrations (int) - inclusive lower bound
+max_registrations (int, nullable) - inclusive upper bound (null = infinity)
+price (decimal 10,2) - price in euros
+position (int) - for ordering tiers
+is_active (boolean) - to enable/disable tiers
+created_at (datetime)
+updated_at (datetime)
+
+UNIQUE constraint on (histoire_id, min_registrations)
+```
+
+### 4. **histoire_registration** (new)
+```
+id (PK)
+histoire_id (FK)
+user_id (FK)
+price_paid (decimal 10,2) - store actual price paid at registration time
+pricing_tier_id (FK, nullable) - which tier was applied
+registered_at (datetime)
+status (enum: 'pending', 'confirmed', 'cancelled')
+```
+
+## Key Features of This Design
+
+**1. Global vs Histoire-Specific Pricing:**
+- When `histoire_id` is NULL → global default pricing tiers
+- When `histoire_id` is set → pricing specific to that histoire
+- System checks histoire-specific first, falls back to global
+
+**2. Flexible Ranges:**
+- `min_registrations`: 0, 10, 50, 200, etc.
+- `max_registrations`: 9, 49, 199, 499, NULL (for "unlimited" or "beyond this")
+- The NULL max_registrations in the last tier before the hard limit allows for "500+"
+
+**3. Hard Limit:**
+You could add a `max_total_registrations` field to the `histoire` table for the absolute cap (500 in your example).
+
+## Example Data
+
+**Default Global Tiers (histoire_id = NULL):**
+```sql
+INSERT INTO histoire_pricing_tier VALUES
+(1, NULL, 0, 9, 10.00, 1, true),
+(2, NULL, 10, 49, 15.00, 2, true),
+(3, NULL, 50, 499, 20.00, 3, true);
+```
+
+**Histoire-Specific Override (for histoire_id = 5):**
+```sql
+INSERT INTO histoire_pricing_tier VALUES
+(4, 5, 0, 19, 8.00, 1, true),
+(5, 5, 20, 99, 12.00, 2, true),
+(6, 5, 100, 299, 18.00, 3, true);
+```
+
+## Symfony Entities
+
+```php
+// src/Entity/HistoirePricingTier.php
+#[ORM\Entity]
+#[ORM\Table(name: 'histoire_pricing_tier')]
+#[ORM\UniqueConstraint(columns: ['histoire_id', 'min_registrations'])]
+class HistoirePricingTier
+{
+    #[ORM\Id]
+    #[ORM\GeneratedValue]
+    #[ORM\Column]
+    private ?int $id = null;
+
+    #[ORM\ManyToOne(targetEntity: Histoire::class)]
+    #[ORM\JoinColumn(nullable: true, onDelete: 'CASCADE')]
+    private ?Histoire $histoire = null;
+
+    #[ORM\Column]
+    private int $minRegistrations;
+
+    #[ORM\Column(nullable: true)]
+    private ?int $maxRegistrations = null;
+
+    #[ORM\Column(type: 'decimal', precision: 10, scale: 2)]
+    private string $price;
+
+    #[ORM\Column]
+    private int $position = 0;
+
+    #[ORM\Column]
+    private bool $isActive = true;
+
+    // getters and setters...
+}
+
+// src/Entity/HistoireRegistration.php
+#[ORM\Entity]
+#[ORM\Table(name: 'histoire_registration')]
+class HistoireRegistration
+{
+    #[ORM\Id]
+    #[ORM\GeneratedValue]
+    #[ORM\Column]
+    private ?int $id = null;
+
+    #[ORM\ManyToOne(targetEntity: Histoire::class)]
+    #[ORM\JoinColumn(nullable: false, onDelete: 'CASCADE')]
+    private Histoire $histoire;
+
+    #[ORM\ManyToOne(targetEntity: User::class)]
+    #[ORM\JoinColumn(nullable: false, onDelete: 'CASCADE')]
+    private User $user;
+
+    #[ORM\Column(type: 'decimal', precision: 10, scale: 2)]
+    private string $pricePaid;
+
+    #[ORM\ManyToOne(targetEntity: HistoirePricingTier::class)]
+    #[ORM\JoinColumn(nullable: true)]
+    private ?HistoirePricingTier $pricingTier = null;
+
+    #[ORM\Column]
+    private \DateTimeImmutable $registeredAt;
+
+    #[ORM\Column(length: 20)]
+    private string $status = 'pending';
+
+    // getters and setters...
+}
+```
+
+## Service to Calculate Price
+
+```php
+// src/Service/HistoirePricingService.php
+namespace App\Service;
+
+use App\Entity\Histoire;
+use App\Repository\HistoirePricingTierRepository;
+use App\Repository\HistoireRegistrationRepository;
+
+class HistoirePricingService
+{
+    public function __construct(
+        private HistoirePricingTierRepository $tierRepository,
+        private HistoireRegistrationRepository $registrationRepository,
+    ) {}
+
+    public function calculatePrice(Histoire $histoire): ?array
+    {
+        // Count current registrations
+        $currentCount = $this->registrationRepository->countActiveByHistoire($histoire);
+
+        // Get applicable tier (histoire-specific first, then global)
+        $tier = $this->tierRepository->findApplicableTier($histoire, $currentCount);
+
+        if (!$tier) {
+            return null; // No tier found = registration not allowed
+        }
+
+        // Check if we've reached the upper limit
+        if ($tier->getMaxRegistrations() !== null && $currentCount >= $tier->getMaxRegistrations()) {
+            return null; // Registration closed
+        }
+
+        return [
+            'price' => $tier->getPrice(),
+            'tier' => $tier,
+            'currentCount' => $currentCount,
+        ];
+    }
+
+    public function canRegister(Histoire $histoire, int $maxLimit = 500): bool
+    {
+        $currentCount = $this->registrationRepository->countActiveByHistoire($histoire);
+        
+        if ($currentCount >= $maxLimit) {
+            return false;
+        }
+
+        $priceData = $this->calculatePrice($histoire);
+        return $priceData !== null;
+    }
+}
+```
+
+## Repository Methods
+
+```php
+// In HistoirePricingTierRepository
+public function findApplicableTier(Histoire $histoire, int $registrationCount): ?HistoirePricingTier
+{
+    // Try histoire-specific tier first
+    $tier = $this->createQueryBuilder('t')
+        ->where('t.histoire = :histoire')
+        ->andWhere('t.isActive = true')
+        ->andWhere('t.minRegistrations <= :count')
+        ->andWhere('t.maxRegistrations IS NULL OR t.maxRegistrations >= :count')
+        ->setParameter('histoire', $histoire)
+        ->setParameter('count', $registrationCount)
+        ->orderBy('t.position', 'ASC')
+        ->setMaxResults(1)
+        ->getQuery()
+        ->getOneOrNullResult();
+
+    if ($tier) {
+        return $tier;
+    }
+
+    // Fallback to global tier
+    return $this->createQueryBuilder('t')
+        ->where('t.histoire IS NULL')
+        ->andWhere('t.isActive = true')
+        ->andWhere('t.minRegistrations <= :count')
+        ->andWhere('t.maxRegistrations IS NULL OR t.maxRegistrations >= :count')
+        ->setParameter('count', $registrationCount)
+        ->orderBy('t.position', 'ASC')
+        ->setMaxResults(1)
+        ->getQuery()
+        ->getOneOrNullResult();
+}
+
+// In HistoireRegistrationRepository
+public function countActiveByHistoire(Histoire $histoire): int
+{
+    return $this->createQueryBuilder('r')
+        ->select('COUNT(r.id)')
+        ->where('r.histoire = :histoire')
+        ->andWhere('r.status IN (:statuses)')
+        ->setParameter('histoire', $histoire)
+        ->setParameter('statuses', ['confirmed', 'pending'])
+        ->getQuery()
+        ->getSingleScalarResult();
+}
+```
+
+
+<?php
+
+// src/Validator/Constraints/ValidPricingTiers.php
+namespace App\Validator\Constraints;
+
+use Symfony\Component\Validator\Constraint;
+
+#[\Attribute]
+class ValidPricingTiers extends Constraint
+{
+    public string $message = 'The pricing tiers configuration is invalid.';
+    public string $gapMessage = 'There is a gap between tier {{ position }} (max: {{ max }}) and tier {{ nextPosition }} (min: {{ min }}).';
+    public string $overlapMessage = 'Tier {{ position }} overlaps with tier {{ nextPosition }}.';
+    public string $invalidRangeMessage = 'Tier {{ position }}: min_registrations ({{ min }}) must be less than max_registrations ({{ max }}).';
+    public string $duplicateMinMessage = 'Multiple tiers have the same min_registrations value: {{ value }}.';
+    public string $negativeMessage = 'Tier {{ position }}: Registrations values cannot be negative.';
+    public string $firstTierMessage = 'The first tier must start at 0 registrations.';
+    
+    public function getTargets(): string
+    {
+        return self::CLASS_CONSTRAINT;
+    }
+}
+
+// src/Validator/Constraints/ValidPricingTiersValidator.php
+namespace App\Validator\Constraints;
+
+use Symfony\Component\Validator\Constraint;
+use Symfony\Component\Validator\ConstraintValidator;
+use Symfony\Component\Validator\Exception\UnexpectedTypeException;
+
+class ValidPricingTiersValidator extends ConstraintValidator
+{
+    public function validate($value, Constraint $constraint): void
+    {
+        if (!$constraint instanceof ValidPricingTiers) {
+            throw new UnexpectedTypeException($constraint, ValidPricingTiers::class);
+        }
+
+        if (!is_array($value) || empty($value)) {
+            return;
+        }
+
+        // Sort tiers by min_registrations for validation
+        $tiers = $value;
+        usort($tiers, fn($a, $b) => $a['min_registrations'] <=> $b['min_registrations']);
+
+        // Check first tier starts at 0
+        if ($tiers[0]['min_registrations'] !== 0) {
+            $this->context->buildViolation($constraint->firstTierMessage)
+                ->addViolation();
+            return;
+        }
+
+        // Check for duplicate min_registrations
+        $minValues = array_column($tiers, 'min_registrations');
+        $duplicates = array_filter(array_count_values($minValues), fn($count) => $count > 1);
+        if (!empty($duplicates)) {
+            foreach ($duplicates as $value => $count) {
+                $this->context->buildViolation($constraint->duplicateMinMessage)
+                    ->setParameter('{{ value }}', $value)
+                    ->addViolation();
+            }
+            return;
+        }
+
+        // Validate each tier and check for gaps/overlaps
+        foreach ($tiers as $index => $tier) {
+            $position = $index + 1;
+            $min = $tier['min_registrations'];
+            $max = $tier['max_registrations'];
+
+            // Check for negative values
+            if ($min < 0 || ($max !== null && $max < 0)) {
+                $this->context->buildViolation($constraint->negativeMessage)
+                    ->setParameter('{{ position }}', $position)
+                    ->addViolation();
+                continue;
+            }
+
+            // Check min < max (when max is not null)
+            if ($max !== null && $min >= $max) {
+                $this->context->buildViolation($constraint->invalidRangeMessage)
+                    ->setParameter('{{ position }}', $position)
+                    ->setParameter('{{ min }}', $min)
+                    ->setParameter('{{ max }}', $max)
+                    ->addViolation();
+                continue;
+            }
+
+            // Check for gaps and overlaps with next tier
+            if (isset($tiers[$index + 1])) {
+                $nextTier = $tiers[$index + 1];
+                $nextMin = $nextTier['min_registrations'];
+                
+                // If current tier has a max, check continuity
+                if ($max !== null) {
+                    if ($max + 1 < $nextMin) {
+                        // Gap detected
+                        $this->context->buildViolation($constraint->gapMessage)
+                            ->setParameter('{{ position }}', $position)
+                            ->setParameter('{{ max }}', $max)
+                            ->setParameter('{{ nextPosition }}', $position + 1)
+                            ->setParameter('{{ min }}', $nextMin)
+                            ->addViolation();
+                    } elseif ($max >= $nextMin) {
+                        // Overlap detected
+                        $this->context->buildViolation($constraint->overlapMessage)
+                            ->setParameter('{{ position }}', $position)
+                            ->setParameter('{{ nextPosition }}', $position + 1)
+                            ->addViolation();
+                    }
+                }
+            }
+        }
+    }
+}
+
+// src/DTO/PricingTierDTO.php
+namespace App\DTO;
+
+use Symfony\Component\Validator\Constraints as Assert;
+
+class PricingTierDTO
+{
+    #[Assert\NotNull(message: 'min_registrations is required')]
+    #[Assert\Type(type: 'integer', message: 'min_registrations must be an integer')]
+    #[Assert\PositiveOrZero(message: 'min_registrations must be 0 or positive')]
+    public ?int $minRegistrations = null;
+
+    #[Assert\Type(type: 'integer', message: 'max_registrations must be an integer or null')]
+    #[Assert\PositiveOrZero(message: 'max_registrations must be positive or null')]
+    public ?int $maxRegistrations = null;
+
+    #[Assert\NotBlank(message: 'price is required')]
+    #[Assert\Type(type: 'numeric', message: 'price must be a number')]
+    #[Assert\Positive(message: 'price must be positive')]
+    #[Assert\LessThanOrEqual(value: 9999999.99, message: 'price cannot exceed 9999999.99')]
+    public ?float $price = null;
+
+    #[Assert\Type(type: 'integer', message: 'position must be an integer')]
+    #[Assert\PositiveOrZero(message: 'position must be 0 or positive')]
+    public int $position = 0;
+
+    #[Assert\Type(type: 'bool', message: 'is_active must be a boolean')]
+    public bool $isActive = true;
+
+    public function __construct(array $data)
+    {
+        $this->minRegistrations = $data['min_registrations'] ?? null;
+        $this->maxRegistrations = $data['max_registrations'] ?? null;
+        $this->price = isset($data['price']) ? (float) $data['price'] : null;
+        $this->position = $data['position'] ?? 0;
+        $this->isActive = $data['is_active'] ?? true;
+    }
+}
+
+// src/DTO/PricingTiersCollectionDTO.php
+namespace App\DTO;
+
+use App\Validator\Constraints as AppAssert;
+use Symfony\Component\Validator\Constraints as Assert;
+
+#[AppAssert\ValidPricingTiers]
+class PricingTiersCollectionDTO
+{
+    /**
+     * @var PricingTierDTO[]
+     */
+    #[Assert\NotBlank(message: 'At least one pricing tier is required')]
+    #[Assert\Type(type: 'array', message: 'tiers must be an array')]
+    #[Assert\Count(
+        min: 1,
+        max: 20,
+        minMessage: 'You must specify at least {{ limit }} pricing tier',
+        maxMessage: 'You cannot specify more than {{ limit }} pricing tiers'
+    )]
+    #[Assert\All([
+        new Assert\Collection([
+            'fields' => [
+                'min_registrations' => [
+                    new Assert\NotNull(message: 'min_registrations is required'),
+                    new Assert\Type(type: 'integer', message: 'min_registrations must be an integer'),
+                    new Assert\PositiveOrZero(message: 'min_registrations must be 0 or positive'),
+                ],
+                'max_registrations' => [
+                    new Assert\Type(type: 'integer', message: 'max_registrations must be an integer or null'),
+                    new Assert\PositiveOrZero(message: 'max_registrations must be positive or null'),
+                ],
+                'price' => [
+                    new Assert\NotBlank(message: 'price is required'),
+                    new Assert\Type(type: 'numeric', message: 'price must be a number'),
+                    new Assert\Positive(message: 'price must be positive'),
+                    new Assert\LessThanOrEqual(value: 9999999.99, message: 'price cannot exceed 9999999.99'),
+                ],
+                'position' => [
+                    new Assert\Type(type: 'integer', message: 'position must be an integer'),
+                    new Assert\PositiveOrZero(message: 'position must be 0 or positive'),
+                ],
+                'is_active' => [
+                    new Assert\Type(type: 'bool', message: 'is_active must be a boolean'),
+                ],
+            ],
+            'allowExtraFields' => true,
+            'allowMissingFields' => false,
+        ])
+    ])]
+    public array $tiers = [];
+
+    #[Assert\Type(type: 'integer', message: 'histoire_id must be an integer or null')]
+    #[Assert\Positive(message: 'histoire_id must be positive')]
+    public ?int $histoireId = null;
+
+    public function __construct(array $data)
+    {
+        $this->tiers = $data['tiers'] ?? [];
+        $this->histoireId = $data['histoire_id'] ?? null;
+    }
+}
+
+// src/Controller/Admin/PricingTierController.php
+namespace App\Controller\Admin;
+
+use App\DTO\PricingTiersCollectionDTO;
+use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
+use Symfony\Component\HttpFoundation\JsonResponse;
+use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\Routing\Annotation\Route;
+use Symfony\Component\Validator\Validator\ValidatorInterface;
+
+#[Route('/admin/pricing-tiers')]
+class PricingTierController extends AbstractController
+{
+    public function __construct(
+        private ValidatorInterface $validator
+    ) {}
+
+    #[Route('/validate', name: 'admin_pricing_tiers_validate', methods: ['POST'])]
+    public function validate(Request $request): JsonResponse
+    {
+        $data = json_decode($request->getContent(), true);
+        
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            return $this->json([
+                'valid' => false,
+                'errors' => ['Invalid JSON format']
+            ], Response::HTTP_BAD_REQUEST);
+        }
+
+        $dto = new PricingTiersCollectionDTO($data);
+        $violations = $this->validator->validate($dto);
+
+        if (count($violations) > 0) {
+            $errors = [];
+            foreach ($violations as $violation) {
+                $errors[] = [
+                    'property' => $violation->getPropertyPath(),
+                    'message' => $violation->getMessage(),
+                ];
+            }
+
+            return $this->json([
+                'valid' => false,
+                'errors' => $errors
+            ], Response::HTTP_UNPROCESSABLE_ENTITY);
+        }
+
+        return $this->json([
+            'valid' => true,
+            'message' => 'Pricing tiers configuration is valid'
+        ]);
+    }
+
+    #[Route('/save', name: 'admin_pricing_tiers_save', methods: ['POST'])]
+    public function save(Request $request): JsonResponse
+    {
+        $data = json_decode($request->getContent(), true);
+        
+        $dto = new PricingTiersCollectionDTO($data);
+        $violations = $this->validator->validate($dto);
+
+        if (count($violations) > 0) {
+            $errors = [];
+            foreach ($violations as $violation) {
+                $errors[] = [
+                    'property' => $violation->getPropertyPath(),
+                    'message' => $violation->getMessage(),
+                ];
+            }
+
+            return $this->json([
+                'success' => false,
+                'errors' => $errors
+            ], Response::HTTP_UNPROCESSABLE_ENTITY);
+        }
+
+        // Here you would persist the tiers to database
+        // $this->pricingTierService->saveTiers($dto);
+
+        return $this->json([
+            'success' => true,
+            'message' => 'Pricing tiers saved successfully'
+        ]);
+    }
+}
+
+// Example usage in tests or documentation
+/*
+Valid example:
+{
+    "histoire_id": null,
+    "tiers": [
+        {
+            "min_registrations": 0,
+            "max_registrations": 9,
+            "price": 10.00,
+            "position": 1,
+            "is_active": true
+        },
+        {
+            "min_registrations": 10,
+            "max_registrations": 49,
+            "price": 15.00,
+            "position": 2,
+            "is_active": true
+        },
+        {
+            "min_registrations": 50,
+            "max_registrations": 499,
+            "price": 20.00,
+            "position": 3,
+            "is_active": true
+        },
+        {
+            "min_registrations": 500,
+            "max_registrations": null,
+            "price": 0,
+            "position": 4,
+            "is_active": false
+        }
+    ]
+}
+
+Invalid examples that will be caught:
+
+1. Gap between tiers:
+{
+    "tiers": [
+        {"min_registrations": 0, "max_registrations": 9, "price": 10},
+        {"min_registrations": 15, "max_registrations": 49, "price": 15}  // Gap: 10-14
+    ]
+}
+
+2. Overlap:
+{
+    "tiers": [
+        {"min_registrations": 0, "max_registrations": 15, "price": 10},
+        {"min_registrations": 10, "max_registrations": 49, "price": 15}  // Overlap: 10-15
+    ]
+}
+
+3. Invalid range:
+{
+    "tiers": [
+        {"min_registrations": 10, "max_registrations": 5, "price": 10}  // min > max
+    ]
+}
+
+4. Doesn't start at 0:
+{
+    "tiers": [
+        {"min_registrations": 10, "max_registrations": 49, "price": 15}  // Must start at 0
+    ]
+}
+
+5. Duplicate min_registrations:
+{
+    "tiers": [
+        {"min_registrations": 0, "max_registrations": 9, "price": 10},
+        {"min_registrations": 0, "max_registrations": 19, "price": 15}  // Duplicate
+    ]
+}
+*/
+
